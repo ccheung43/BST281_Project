@@ -1,0 +1,350 @@
+---
+title: "BST 281 - Final Project"
+author: "Caitlin Cheung"
+date: "2024-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Raw Sample Extraction
+
+### a. SRA Toolkit
+
+Run SRA Toolkit to extract raw FASTQ files from NCBI.
+
+```{r, engine="bash", eval=FALSE}
+s
+#!/bin/bash
+#SBATCH --job-name=fastq_dump
+#SBATCH --output=fastq_dump_%j.out
+#SBATCH --error=fastq_dump_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=24:00:00   
+#SBATCH --mem=64G  
+
+conda activate sra
+
+outdir="/shared/home/cac8967/281_final/fastq"
+SRR_file="/shared/home/cac8967/281_final/SRR_Acc_List.txt"
+
+# Loop through each SRR number in the file
+while IFS= read -r SRR_number; do
+    # Run fastq-dump for the current SRR number
+    fastq-dump --split-files --origfmt --gzip "$SRR_number" --outdir "$outdir"
+done < "$SRR_file"
+
+
+#tr -d '\r' < run_fastq_dump.slurm > run_fastq_dump_unix.slurm
+#sbatch run_fastq_dump_unix.slurm
+```
+
+## 2. Quality Control
+
+### a. FASTQC and MultiQC
+
+Run FASTQC on each raw FASTQ file to perform quality control of sample sequences. Then run MultiQC to combine FASTQC results into one .html document.
+
+```{r, engine="bash", eval=FALSE}
+outdir="/shared/home/cac8967/281_final/fastqc/"
+
+cd "/shared/home/cac8967/281_final/fastq"
+fastqc -o "$outdir" -t 6 *.fastq.gz
+
+multiqc "${outdir}." -o "$outdir"
+
+# (Per Base Sequence Content) Biased fragmentation: Any library which is generated based on the ligation of random hexamers or through tagmentation should theoretically have good diversity through the sequence, but experience has shown that these libraries always have a selection bias in around the first 12bp of each run. This is due to a biased selection of random primers, but doesn't represent any individually biased sequences. Nearly all RNA-Seq libraries will fail this module because of this bias, but this is not a problem which can be fixed by processing, and it doesn't seem to adversely affect the ablity to measure expression.
+
+```
+
+```{r}
+knitr::include_graphics("results/qc_before.png")
+```
+
+### b. Cutadapt
+
+Run cutadapt to trim the raw FASTQ files based on a quality score threshold of 20.
+
+```{r, engine="bash", eval=FALSE}
+
+#!/bin/bash
+#SBATCH --job-name=cutadapt
+#SBATCH --output=fastq_dump_%j.out
+#SBATCH --error=fastq_dump_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=10 
+#SBATCH --time=24:00:00   
+#SBATCH --mem=64G  
+
+# Load necessary modules (if any)
+conda activate trim
+
+fastq="/shared/home/cac8967/281_final/fastq"
+trimmed="/shared/home/cac8967/281_final/trimmed_fastq"
+
+for forward_read in "$fastq"/*_1.fastq.gz; do
+    reverse_read="${forward_read/_1.fastq.gz/_2.fastq.gz}"  # Generate corresponding reverse read filename
+    trimmed_output="$trimmed/trimmed_$(basename "$forward_read")"  # Construct output filename
+    cutadapt -q 20 -o "$trimmed_output" -p "${trimmed_output/_1.fastq.gz/_2.fastq.gz}" "$forward_read" "$reverse_read"
+done
+
+
+tr -d '\r' < run_cutadapt.slurm > run_cutadapt_unix.slurm
+sbatch run_cutadapt_unix.slurm
+
+```
+
+### c. FASTQC and MultiQC
+
+Run FASTQC again, this time on the trimmed FASTQ files and then run MultiQC again to compile quality control files into one file.
+
+```{r, engine="bash", eval=FALSE}
+
+outdir="/shared/home/cac8967/281_final/fastqc_trimmed/"
+
+cd "/shared/home/cac8967/281_final/fastq_trimmed"
+fastqc -o "$outdir" -t 10 *.fastq.gz
+
+multiqc "${outdir}." -o "$outdir"
+```
+
+```{r}
+knitr::include_graphics("results/qc_after.png")
+```
+
+## 3. Quantification
+
+### a. Salmon
+
+Run Salmon on the raw FASTQ files to pseudo-align to the reference transcriptome and quantify transcript abundance.
+
+```{r, engine="bash", eval=FALSE}
+salmon_index_dir="/shared/home/cac8967/281_final/salmon_index"
+reference_dir="/shared/home/cac8967/281_final/reference/gencode.v45.pc_transcripts.fa.gz"
+
+salmon index -t "$reference_dir" -i "$salmon_index_dir"
+	
+
+#!/bin/bash
+#SBATCH --job-name=salmon
+#SBATCH --output=salmon_%j.out
+#SBATCH --error=salmon_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=10 
+#SBATCH --time=24:00:00   
+#SBATCH --mem=64G  
+
+conda activate /shared/home/cac8967/miniconda3/envs/hw1
+
+fastq_dir="/shared/home/cac8967/281_final/fastq"
+salmon_index_dir="/shared/home/cac8967/281_final/salmon_index"
+salmon_output_dir="/shared/home/cac8967/281_final/salmon_output"
+
+for fn in "$fastq_dir"/*_1.fastq.gz; do
+    samp=$(basename "$fn" | sed 's/_1.fastq.gz//')
+    echo "Processing sample ${samp}"
+    salmon quant -i "$salmon_index_dir" -l A \
+         -1 "${fn}" \
+         -2 "${fn/_1/_2}" \
+         -p 10 --validateMappings -o "${salmon_output_dir}/${samp}_quant"
+done
+
+tr -d '\r' < run_salmon.slurm > run_salmon_unix.slurm
+sbatch run_salmon_unix.slurm
+
+```
+
+### b. Tximeta
+
+Run tximeta on Salmon quant.sf files to
+
+```{r, eval=FALSE}
+# citation for construction of gene expression matrix: 
+#https://bookdown.org/jean_souza/PreProcSEQ/case-study-construction-of-the-gene-expression-matrix-for-the-raw-data-of-the-cohort-gse113179.html
+
+#BiocManager::install("tximeta")
+library(tximeta)
+library(SummarizedExperiment)
+library(GenomicFeatures)
+library(AnnotationHub)
+library(ensembldb)
+library(edgeR)
+
+indexDir = file.path("C:/Users/caitl/OneDrive/Documents/BST281/Final/salmon_index")
+gffPath = file.path("C:/Users/caitl/OneDrive/Documents/BST281/Final/gencode.v45.annotation.gff3")
+fastaFTP = "ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/gencode.v45.transcripts.fa.gz"
+
+makeLinkedTxome(indexDir = indexDir,
+                source = "GENCODE",
+                organism = "Homo sapiens",
+                release = "45",
+                genome = "GRCh38",
+                fasta = fastaFTP,
+                gtf = gffPath,
+                write = FALSE)
+
+
+dirquant <- "C:/Users/caitl/OneDrive/Documents/BST281/Final/salmon_quant"
+coldata = data.frame(names = metadata$Run)
+coldata$files <- paste0(dirquant,"/",coldata$names,".sf")
+all(file.exists(coldata$files))
+rownames(coldata) <- coldata$names
+
+dirquant <- "C:/Users/caitl/OneDrive/Documents/BST281/Final/salmon_output"
+
+coldata = data.frame(names = metadata$Run)
+coldata$files <- paste0(dirquant,"/",coldata$names,"_quant/","quant.sf")
+all(file.exists(coldata$files))
+rownames(coldata) <- coldata$names
+
+se <- tximeta(coldata, useHub = F)
+gse <- summarizeToGene(se)
+
+save(gse, file="matrix_gse_salmon_tximeta.RData")
+
+load("matrix_gse_salmon_tximeta.RData")
+
+#DT::datatable(TMM@assays@data$counts[1:5,])
+#DT::datatable(gse@assays@data$abundance[1:5,])
+#DT::datatable(gse@assays@data$length[1:5,])
+
+
+ah <- AnnotationHub()
+edb <- query(ah, pattern = c("Homo sapiens", "EnsDb",106))[[1]]
+gns <- genes(edb)
+EnsDbAnnotation <- as.data.frame(gns)
+EnsDbAnnotation <- EnsDbAnnotation[,c("gene_id","symbol","gene_biotype","entrezid")]
+colnames(EnsDbAnnotation) <- c("ensemblid","symbol","gene_biotype","entrezid")
+gseAnnotation <- rowData(gse)
+
+rownames(gseAnnotation) <- stringr::str_replace(rownames(gseAnnotation), "\\...$", "")
+rownames(gseAnnotation) <- stringr::str_replace(rownames(gseAnnotation), "\\..$", "")
+all(rownames(gseAnnotation)%in%rownames(EnsDbAnnotation))
+rowAnnotation <- EnsDbAnnotation[rownames(gseAnnotation),]
+rowAnnotation <- data.frame(gseAnnotation, rowAnnotation, stringsAsFactors = F)
+rownames(rowAnnotation) <- rowAnnotation$gene_id
+rowData(gse) <- rowAnnotation
+saveRDS(gse, file = "matrix_gse_salmon_tximeta_noted.RData.rds")
+
+gexp.counts.brut <- assay(gse)
+
+dge <- DGEList(counts=gexp.counts.brut)
+dge <- calcNormFactors(dge)
+gexp.TMM <- cpm(dge)
+
+gse.TMM <- gse
+gse.TMM@assays@data$abundance <- gexp.TMM
+
+```
+
+### c. Plots
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+gse <- readRDS("results/matrix_gse_salmon_tximeta.rds")
+metadata <- readRDS("data/colAnnotation.rds")
+TPM <- gse@assays@data$abundance
+length <- gse@assays@data$length
+log2TPM <- as.data.frame(log2(TPM + 1))
+
+tpm_longer <- log2TPM |>
+  pivot_longer(1:10, names_to = "Run", values_to = "log2TPM") |> 
+  filter(log2TPM != 0)
+
+disease_df <- metadata |> select(c("Run", "disease_state"))
+tpm_longer <-  merge(tpm_longer, disease_df, by = "Run")
+
+tpm_longer |> ggplot(aes(x = log2TPM, fill = disease_state)) + 
+  geom_histogram() + 
+  facet_wrap(~Run) + 
+  labs(x = "log2TPM", y = "Counts",
+       title = "Histogram of Normalized Gene Abundances", 
+       subtitle = "faceted by sample", 
+       fill = "Disease State")
+
+s1 <- data.frame(log2TPM = log2TPM[,1], length = length[,1]) |> 
+  mutate( peak = if_else(log2TPM < 1, "1", "2"))
+
+S1 <- tpm_longer |> filter(Run %in% c("SRR27960830", "SRR27960831")) |> 
+  ggplot(aes(x = log2TPM)) + 
+  geom_histogram(fill = "darkseagreen3", bins = 25, color = "black") + 
+  facet_wrap(~Run) + 
+  labs(x = "log2TPM", y = "Counts",
+       title = "Histogram of Normalized Gene Abundances") + 
+  theme_classic2()
+
+
+rowAnnotation <- readRDS("C:/Users/caitl/OneDrive//Documents/BST281/Final/data/rowAnnotation.rds")
+peak1 <- s1 |> filter(peak == "1")
+genes1 <- rowAnnotation$symbol[match(rownames(peak1), rowAnnotation$gene_id)]
+writeLines(genes1, "g1.txt")
+peak2 <- s1 |> filter(peak == "2")
+genes2 <- rowAnnotation$symbol[match(rownames(peak2), rowAnnotation$gene_id)]
+writeLines(genes2, "g2.txt")
+
+S1
+
+
+```
+
+```{r}
+#load("matrix_gse_salmon_tximeta.RData")
+TMM <- readRDS("C:/Users/caitl/OneDrive//Documents/BST281/Final/results/gse_tmm.rds")
+counts <- as.data.frame(TMM@assays@data$counts) 
+rowAnnotation <- readRDS("C:/Users/caitl/OneDrive//Documents/BST281/Final/data/rowAnnotation.rds")
+rowAnnotation <- rowAnnotation |> filter(entrezid != "NA") |> 
+  filter(!duplicated(entrezid))
+counts<- counts[rownames(rowAnnotation),]
+rownames(counts) <- rowAnnotation$entrezid
+
+paper_counts <- read.csv("data/GSE255720_submission_normalized_counts.csv")
+rownames(paper_counts) <- paper_counts$ENTREZID
+paper_counts<- paper_counts[2:nrow(paper_counts), 4:ncol(paper_counts)]
+metadata <- readRDS("data/colAnnotation.rds")
+trial_to_SRR <- match(colnames(paper_counts), metadata$trial)
+colnames(paper_counts) <- metadata$Run[trial_to_SRR]
+
+merged_cols <- intersect(colnames(counts), colnames(paper_counts))
+merged_rows <- intersect(rownames(counts), rownames(paper_counts))
+
+counts <- counts[merged_rows, merged_cols] 
+counts <- counts |> mutate(extrez_id = rownames(counts)) |> 
+  pivot_longer(1:10, names_to = "Sample", values_to = "My_Counts")
+paper_counts <- paper_counts[merged_rows, merged_cols]
+paper_counts<- paper_counts |> mutate(entrez_id = rownames(paper_counts)) |> 
+  pivot_longer(1:10, names_to = "Sample", values_to = "Paper_Counts") |> 
+  mutate(Paper_Counts = as.numeric(Paper_Counts))
+
+merged_df <- counts |> mutate(Paper_Counts = paper_counts$Paper_Counts)
+
+
+corr <- cor(log2(merged_df$My_Counts + 1), log2(merged_df$Paper_Counts + 1)) 
+merged_df |> filter(Sample %in% c("SRR27960830", "SRR27960831")) |> 
+  ggplot(aes(x = log2(My_Counts + 1), y = log2(Paper_Counts + 1))) + 
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "brown3", size = 3) + 
+  facet_wrap(~Sample) + 
+  labs(title = "Scatterplot Comparison Analysis", 
+       subtitle = paste("Correlation = ", round(corr, 2)), 
+       x = "log2(My Results)", y = "log2(Cornell Results)") + 
+  theme_classic2()
+
+```
+
+```{r}
+TMM <- readRDS("C:/Users/caitl/OneDrive//Documents/BST281/Final/results/gse_tmm.rds")
+TMM <- as.data.frame(TMM@assays@data$abundance) 
+rowAnnotation <- readRDS("C:/Users/caitl/OneDrive//Documents/BST281/Final/data/rowAnnotation.rds")
+rownames(TMM) <- rowAnnotation$tx_ids
+
+TMM$sum = rowSums(TMM)
+
+TMM |> arrange(desc(sum)) |> slice_head(n = 5)
+```
